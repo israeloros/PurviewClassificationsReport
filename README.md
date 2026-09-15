@@ -17,8 +17,8 @@ and produces a workbook with three sheets:
 ## Requirements
 
 - Python 3.9+
-- Azure credentials with permission to read the target Purview account (Data
-  Reader / Data Source Administrator or equivalent), resolved via
+- An existing Microsoft Purview account
+- Azure credentials authorized for the target Purview account, resolved via
   [`DefaultAzureCredential`](https://learn.microsoft.com/python/api/azure-identity/azure.identity.defaultazurecredential)
   (environment/service principal, managed identity, Azure CLI login, etc.)
 
@@ -27,6 +27,38 @@ Install dependencies:
 ```powershell
 pip install -r requirements.txt
 ```
+
+### Service principal and Purview permissions
+
+A service principal is the recommended authentication method for scheduled,
+unattended, or automated report generation. For local interactive use, a
+service principal is optional because `DefaultAzureCredential` can also use an
+authenticated Azure CLI, Visual Studio, or Visual Studio Code session.
+
+To use a service principal:
+
+1. Create a Microsoft Entra application and service principal, then create a
+   client secret. See:
+   [API authentication for Microsoft Purview data planes](https://learn.microsoft.com/purview/data-gov-api-rest-data-plane)
+   and
+   [Create Azure service principals using the Azure CLI](https://learn.microsoft.com/cli/azure/azure-cli-sp-tutorial-1).
+2. In the Microsoft Purview governance portal, assign the service principal
+   these Data Map roles:
+   - **Data Curator** — required to query the catalog data plane.
+   - **Data Source Administrator** — required to enumerate registered data
+     sources through the scanning data plane.
+3. Assign the roles at the root collection to report across the entire Data
+   Map, or at the appropriate collection when the report should be restricted
+   to that collection and its descendants. A **Collection Admin** must perform
+   the role assignments.
+4. Set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` in
+   `purview.env`. `DefaultAzureCredential` automatically uses these values.
+
+For more information, see:
+
+- [Microsoft Purview data-plane API authentication](https://learn.microsoft.com/purview/data-gov-api-rest-data-plane)
+- [Azure Identity client library for Python](https://learn.microsoft.com/python/api/overview/azure/identity-readme)
+- [Service principal authentication for Microsoft Purview](https://learn.microsoft.com/purview/data-map-service-principal)
 
 ## Configuration
 
