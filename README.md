@@ -44,7 +44,7 @@ To use a service principal:
    [Create Azure service principals using the Azure CLI](https://learn.microsoft.com/cli/azure/azure-cli-sp-tutorial-1).
 2. In the Microsoft Purview governance portal, assign the service principal
    these Data Map roles:
-   - **Data Curator** — required to query the catalog data plane.
+   - **Data Reader** — sufficient to query the catalog data plane.
    - **Data Source Administrator** — required to enumerate registered data
      sources through the scanning data plane.
 3. Assign the roles at the root collection to report across the entire Data
