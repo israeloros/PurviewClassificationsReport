@@ -1,0 +1,5 @@
+requests
+azure-identity
+azure-core
+python-dotenv
+openpyxl
