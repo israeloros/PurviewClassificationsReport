@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -17,7 +18,13 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 API_VERSION = "2023-09-01"
 DEFAULT_ENV_FILE = "purview.env"
-DEFAULT_OUTPUT_FILE = "purview-data-source-classifications.xlsx"
+DEFAULT_OUTPUT_DIRECTORY = "reports"
+DEFAULT_FILENAME_SUFFIX = "classifications"
+MODIFIED_TIME_RANGES = {
+    "24h": "LAST_24H",
+    "7d": "LAST_7D",
+    "30d": "LAST_30D",
+}
 REQUEST_TIMEOUT_SECONDS = 60
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 SELECTED_FILL = PatternFill("solid", fgColor="D9EAD3")
@@ -50,9 +57,28 @@ def parse_args():
         help="Enumerate registered Purview data sources on screen and exit.",
     )
     parser.add_argument(
-        "--output",
-        default=DEFAULT_OUTPUT_FILE,
-        help=f"Output XLSX path (default: {DEFAULT_OUTPUT_FILE}).",
+        "--filename-suffix",
+        default=DEFAULT_FILENAME_SUFFIX,
+        help=(
+            "Filename suffix placed before the .xlsx extension "
+            f"(default: {DEFAULT_FILENAME_SUFFIX})."
+        ),
+    )
+    parser.add_argument(
+        "--output-directory",
+        default=DEFAULT_OUTPUT_DIRECTORY,
+        help=(
+            "Directory where generated XLSX files are stored "
+            f"(default: {DEFAULT_OUTPUT_DIRECTORY})."
+        ),
+    )
+    parser.add_argument(
+        "--file-per-data-source",
+        action="store_true",
+        help=(
+            "Generate a separate XLSX file for each data source in scope. Each "
+            "filename is prefixed with the related data source name."
+        ),
     )
     parser.add_argument(
         "--env-file",
@@ -74,6 +100,15 @@ def parse_args():
         metavar="[1-1000]",
         help="Purview discovery results per request (default: 1000).",
     )
+    parser.add_argument(
+        "--modified-within",
+        choices=MODIFIED_TIME_RANGES,
+        metavar="{24h,7d,30d}",
+        help=(
+            "Only include catalog assets modified within the previous 24 hours, "
+            "7 days, or 30 days."
+        ),
+    )
     args = parser.parse_args()
     if args.qualified_name_prefix and (
         not args.data_source or args.data_source.casefold() == "all"
@@ -81,6 +116,8 @@ def parse_args():
         parser.error(
             "--qualified-name-prefix requires a specific --data-source value."
         )
+    if args.file_per_data_source and not args.data_source:
+        parser.error("--file-per-data-source requires --data-source.")
     return args
 
 
@@ -117,12 +154,24 @@ def list_data_sources(session, endpoint, headers):
     return data_sources
 
 
-def list_catalog_assets(session, endpoint, headers, page_size):
+def list_catalog_assets(
+    session,
+    endpoint,
+    headers,
+    page_size,
+    modified_within=None,
+):
     url = f"{endpoint}/datamap/api/search/query?api-version={API_VERSION}"
     continuation_token = None
 
     while True:
         body = {"keywords": None, "limit": page_size}
+        if modified_within:
+            body["filter"] = {
+                "attributeName": "modifiedTime",
+                "operator": "timerange",
+                "attributeValue": MODIFIED_TIME_RANGES[modified_within],
+            }
         if continuation_token:
             body["continuationToken"] = continuation_token
 
@@ -338,7 +387,6 @@ def add_table(worksheet, name):
 
 def format_worksheet(worksheet, widths):
     worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
     worksheet.sheet_view.showGridLines = False
     worksheet.row_dimensions[1].height = 28
 
@@ -354,6 +402,45 @@ def format_worksheet(worksheet, widths):
 
     for column, width in widths.items():
         worksheet.column_dimensions[column].width = width
+
+
+def sanitize_filename_component(value):
+    return re.sub(
+        r'[<>:"/\\|?*\x00-\x1f]',
+        "_",
+        value.strip(),
+    ).strip(" .")
+
+
+def report_output_path(output_directory, filename_suffix):
+    safe_filename_suffix = sanitize_filename_component(filename_suffix)
+    if not safe_filename_suffix:
+        raise PurviewApiError(
+            "The filename suffix must contain at least one valid filename character."
+        )
+    return Path(output_directory) / f"{safe_filename_suffix}.xlsx"
+
+
+def data_source_output_path(output_path, source_name):
+    output_path = Path(output_path)
+    safe_source_name = sanitize_filename_component(source_name)
+    if not safe_source_name:
+        safe_source_name = "data-source"
+    return output_path.with_name(f"{safe_source_name}-{output_path.name}")
+
+
+def unique_output_path(output_path, used_output_paths):
+    candidate = output_path
+    suffix_number = 2
+    normalized_path = str(candidate.absolute()).casefold()
+    while normalized_path in used_output_paths:
+        candidate = output_path.with_name(
+            f"{output_path.stem}-{suffix_number}{output_path.suffix}"
+        )
+        suffix_number += 1
+        normalized_path = str(candidate.absolute()).casefold()
+    used_output_paths.add(normalized_path)
+    return candidate
 
 
 def create_workbook(
@@ -644,7 +731,13 @@ def main():
 
             print("Retrieving catalog assets...")
             assets = list(
-                list_catalog_assets(session, endpoint, headers, args.page_size)
+                list_catalog_assets(
+                    session,
+                    endpoint,
+                    headers,
+                    args.page_size,
+                    args.modified_within,
+                )
             )
 
         assets_by_source, summaries, unmatched_count = aggregate_assets(
@@ -652,14 +745,48 @@ def main():
             assets,
             source_index,
         )
-        create_workbook(
-            args.output,
-            report_sources,
-            "ALL" if include_all_sources else selected_source.get("name", ""),
-            source_index,
-            assets_by_source,
-            summaries,
+        base_output_path = report_output_path(
+            args.output_directory,
+            args.filename_suffix,
         )
+        created_reports = []
+        if args.file_per_data_source:
+            used_output_paths = set()
+            for source in sorted(
+                report_sources,
+                key=lambda item: item.get("name", "").casefold(),
+            ):
+                source_name = source.get("name", "")
+                output_path = unique_output_path(
+                    data_source_output_path(base_output_path, source_name),
+                    used_output_paths,
+                )
+                create_workbook(
+                    output_path,
+                    [source],
+                    source_name,
+                    source_index,
+                    assets_by_source,
+                    summaries,
+                )
+                created_reports.append((source_name, output_path))
+        else:
+            create_workbook(
+                base_output_path,
+                report_sources,
+                "ALL" if include_all_sources else selected_source.get("name", ""),
+                source_index,
+                assets_by_source,
+                summaries,
+            )
+            created_reports.append(
+                (
+                    "ALL"
+                    if include_all_sources
+                    else selected_source.get("name", ""),
+                    base_output_path,
+                )
+            )
 
         report_asset_count = sum(
             len(assets_by_source[source.get("name", "")])
@@ -670,10 +797,18 @@ def main():
             if include_all_sources
             else f"'{selected_source.get('name', '')}'"
         )
-        print(
-            f"Created {Path(args.output).resolve()} with {report_asset_count} assets "
-            f"for {report_scope}."
-        )
+        if args.file_per_data_source:
+            print(
+                f"Created {len(created_reports)} reports with {report_asset_count} "
+                f"assets for {report_scope}:"
+            )
+            for source_name, output_path in created_reports:
+                print(f"- {source_name}: {output_path.resolve()}")
+        else:
+            print(
+                f"Created {created_reports[0][1].resolve()} with "
+                f"{report_asset_count} assets for {report_scope}."
+            )
         if unmatched_count:
             print(
                 f"Warning: {unmatched_count} catalog assets could not be mapped to a "

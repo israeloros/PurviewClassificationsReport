@@ -74,10 +74,13 @@ python PurviewClassificationsReport.py [options]
 |---|---|
 | `--data-source <name>` | Registered data source name to report on, or `ALL` for every registered source. Mutually exclusive with `--list-data-sources`. |
 | `--list-data-sources` | List registered data source names on screen and exit. |
-| `--output <path>` | Output `.xlsx` path (default: `purview-data-source-classifications.xlsx`). |
+| `--filename-suffix <suffix>` | Filename suffix placed before the `.xlsx` extension (default: `classifications`). |
+| `--output-directory <path>` | Directory where generated files are stored (default: `reports`). |
+| `--file-per-data-source` | Generate a separate workbook for each data source in scope and prefix each filename with its data source name. Requires `--data-source`. |
 | `--env-file <path>` | Environment file to load (default: `purview.env`). |
 | `--qualified-name-prefix <prefix>` | Optional `qualifiedName` prefix to match assets when the registration has no usable endpoint metadata. Requires a specific `--data-source` (not `ALL`). |
 | `--page-size <1-1000>` | Number of catalog search results per request (default: 1000). |
+| `--modified-within <24h\|7d\|30d>` | Only include catalog assets modified within the previous 24 hours, 7 days, or 30 days. |
 
 ### Examples
 
@@ -93,11 +96,31 @@ Generate a report for a single data source:
 python PurviewClassificationsReport.py --data-source "SqlServer-Prod"
 ```
 
-Generate a report for every registered data source, with a custom output path:
+Generate a combined report for every registered data source. By default, this
+creates `reports\classifications.xlsx`:
 
 ```powershell
-python PurviewClassificationsReport.py --data-source ALL --output "reports\allsourceclassifications.xlsx"
+python PurviewClassificationsReport.py --data-source ALL
 ```
+
+Generate a separate report for every registered data source:
+
+```powershell
+python PurviewClassificationsReport.py --data-source ALL --file-per-data-source
+```
+
+This creates files such as `reports\SqlServer-Prod-classifications.xlsx`. Data
+source characters that are invalid in Windows filenames are replaced with
+underscores.
+
+Use a custom output directory and filename suffix:
+
+```powershell
+python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --output-directory "exports" --filename-suffix "classification-inventory"
+```
+
+This creates files such as
+`exports\SqlServer-Prod-classification-inventory.xlsx`.
 
 Use a non-default environment file:
 
@@ -119,6 +142,13 @@ Reduce catalog search page size (e.g. to work around throttling):
 python PurviewClassificationsReport.py --data-source ALL --page-size 200
 ```
 
+Generate separate reports containing only assets modified in the previous
+seven days:
+
+```powershell
+python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --modified-within 7d
+```
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
@@ -128,5 +158,7 @@ This project is licensed under the [MIT License](LICENSE).
 - If the script reports assets it couldn't match to a registered data source,
   it prints a warning with the unmatched count; consider `--qualified-name-prefix`
   for that source.
+- `--modified-within` filters on the Purview catalog asset's `modifiedTime`.
+  It does not represent the time when an individual classification was assigned.
 - The generated workbook opens in Excel with filterable tables, frozen header
   rows, and styled headers on each sheet.
