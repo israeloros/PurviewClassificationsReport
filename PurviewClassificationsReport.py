@@ -1,3 +1,15 @@
+"""Generate Excel reports of Microsoft Purview asset classifications.
+
+The script authenticates with :class:`azure.identity.DefaultAzureCredential`,
+retrieves registered data sources and catalog assets from the Microsoft Purview
+data-plane APIs, maps assets to registrations by normalized locator, and writes
+one combined workbook or one workbook per data source.
+
+Configuration is read from an environment file. ``PURVIEW_ACCOUNT_NAME`` is
+required; Azure Identity environment variables are optional when another
+``DefaultAzureCredential`` source, such as Azure CLI, is available.
+"""
+
 import argparse
 import os
 import re
@@ -33,10 +45,23 @@ BODY_FONT = Font(name="Arial", color="000000")
 
 
 class PurviewApiError(RuntimeError):
+    """Report an expected Purview request, configuration, or output error."""
+
     pass
 
 
 def parse_args():
+    """Parse and validate command-line report options.
+
+    Returns:
+        argparse.Namespace: Validated command-line arguments.
+
+    Notes:
+        ``argparse`` terminates the process for invalid combinations. A custom
+        qualified-name prefix is valid only for one named data source, while
+        per-source output requires the data-source selection mode.
+    """
+
     parser = argparse.ArgumentParser(
         description=(
             "Create an XLSX report of Microsoft Purview classifications by "
@@ -122,6 +147,23 @@ def parse_args():
 
 
 def request_json(session, method, url, headers, **kwargs):
+    """Send an HTTP request and decode its JSON response.
+
+    Args:
+        session (requests.Session): Session used to reuse HTTP connections.
+        method (str): HTTP method, such as ``GET`` or ``POST``.
+        url (str): Fully qualified Purview API URL.
+        headers (dict): Request headers, including the bearer token.
+        **kwargs: Additional arguments forwarded to ``Session.request``.
+
+    Returns:
+        Any: The JSON-compatible response body.
+
+    Raises:
+        PurviewApiError: If the request fails, returns an unsuccessful status,
+            or contains invalid JSON.
+    """
+
     try:
         response = session.request(
             method,
@@ -142,6 +184,17 @@ def request_json(session, method, url, headers, **kwargs):
 
 
 def list_data_sources(session, endpoint, headers):
+    """Retrieve every registered data source from the scanning data plane.
+
+    Args:
+        session (requests.Session): Authenticated HTTP session.
+        endpoint (str): Purview account endpoint without a trailing path.
+        headers (dict): Request headers accepted by the Purview API.
+
+    Returns:
+        list[dict]: Data-source registration objects across all API pages.
+    """
+
     url = f"{endpoint}/scan/datasources?api-version={API_VERSION}"
     data_sources = []
 
@@ -161,6 +214,24 @@ def list_catalog_assets(
     page_size,
     modified_within=None,
 ):
+    """Yield catalog assets from the Purview discovery search API.
+
+    Args:
+        session (requests.Session): Authenticated HTTP session.
+        endpoint (str): Purview account endpoint without a trailing path.
+        headers (dict): Request headers accepted by the Purview API.
+        page_size (int): Maximum number of assets requested per API page.
+        modified_within (str | None): Optional CLI time-range key from
+            ``MODIFIED_TIME_RANGES``.
+
+    Yields:
+        dict: One catalog asset from each paginated search response.
+
+    Notes:
+        The modified-time filter applies to the asset, not to the time at which
+        a classification was assigned.
+    """
+
     url = f"{endpoint}/datamap/api/search/query?api-version={API_VERSION}"
     continuation_token = None
 
@@ -184,6 +255,18 @@ def list_catalog_assets(
 
 
 def normalize_locator(value):
+    """Normalize an endpoint or qualified name for locator comparison.
+
+    Normalization is case-insensitive, converts backslashes to slashes, removes
+    URI schemes and query/fragment components, and strips outer slashes.
+
+    Args:
+        value (Any): Locator-like value; falsey values produce an empty string.
+
+    Returns:
+        str: A normalized host-and-path locator.
+    """
+
     text = str(value or "").strip().lower().replace("\\", "/")
     if not text:
         return ""
@@ -196,6 +279,17 @@ def normalize_locator(value):
 
 
 def iter_nested_values(value, key_path=()):
+    """Recursively yield string leaves and their key paths.
+
+    Args:
+        value (Any): Nested dictionary, list, or scalar to inspect.
+        key_path (tuple[str, ...]): Path accumulated by recursive calls.
+
+    Yields:
+        tuple[tuple[str, ...], str]: The dictionary-key path and string value
+        for each string leaf. List indexes are intentionally omitted.
+    """
+
     if isinstance(value, dict):
         for key, child in value.items():
             yield from iter_nested_values(child, key_path + (str(key),))
@@ -207,6 +301,20 @@ def iter_nested_values(value, key_path=()):
 
 
 def data_source_locators(data_source):
+    """Extract candidate asset locators from a data-source registration.
+
+    Known endpoint-like properties are searched recursively. For services that
+    register a child database, resource, or warehouse separately, that child
+    name is also appended to the primary endpoint to create a more specific
+    locator.
+
+    Args:
+        data_source (dict): Purview scanning data-source registration.
+
+    Returns:
+        list[str]: Unique normalized locators, longest first.
+    """
+
     locator_keys = {
         "endpoint",
         "host",
@@ -245,6 +353,19 @@ def data_source_locators(data_source):
 
 
 def locator_matches(qualified_name, locator):
+    """Return whether a locator identifies a qualified asset name.
+
+    A match may be exact, a path prefix, or a complete path segment within the
+    qualified name. Segment delimiters prevent partial host or path matches.
+
+    Args:
+        qualified_name (Any): Catalog asset qualified name.
+        locator (Any): Registration locator to test.
+
+    Returns:
+        bool: ``True`` when the normalized locator identifies the asset.
+    """
+
     qualified_name = normalize_locator(qualified_name)
     locator = normalize_locator(locator)
     if not qualified_name or not locator:
@@ -258,6 +379,20 @@ def locator_matches(qualified_name, locator):
 
 
 def build_source_index(data_sources, selected_name=None, selected_prefix=None):
+    """Build the ordered registration-to-locator index used for matching.
+
+    Args:
+        data_sources (list[dict]): All registered Purview data sources.
+        selected_name (str | None): Optional selected registration name.
+        selected_prefix (str | None): Optional locator override for the selected
+            registration. It is preferred but does not discard discovered
+            locators.
+
+    Returns:
+        list[tuple[dict, list[str]]]: Registrations paired with their locators.
+        When a source is selected, its entry is sorted first.
+    """
+
     source_index = []
     for source in data_sources:
         locators = data_source_locators(source)
@@ -282,6 +417,17 @@ def build_source_index(data_sources, selected_name=None, selected_prefix=None):
 
 
 def match_asset_to_source(asset, source_index):
+    """Find the most specific registered data source for an asset.
+
+    Args:
+        asset (dict): Purview catalog asset containing ``qualifiedName``.
+        source_index (list[tuple[dict, list[str]]]): Registration locator index.
+
+    Returns:
+        dict | None: Registration with the longest matching locator, or ``None``
+        when no locator matches.
+    """
+
     qualified_name = asset.get("qualifiedName")
     matches = []
 
@@ -299,6 +445,18 @@ def match_asset_to_source(asset, source_index):
 
 
 def classification_names(asset):
+    """Return the unique classification names assigned to an asset.
+
+    Purview responses may represent classifications as strings or objects.
+    Object values prefer ``typeName`` and fall back to ``name``.
+
+    Args:
+        asset (dict): Catalog asset returned by discovery search.
+
+    Returns:
+        list[str]: Case-insensitively sorted, unique classification names.
+    """
+
     names = set()
     for classification in asset.get("classification") or []:
         if isinstance(classification, str):
@@ -313,6 +471,17 @@ def classification_names(asset):
 
 
 def source_property(source, *keys):
+    """Return the first populated registration property among candidate keys.
+
+    Args:
+        source (dict): Purview data-source registration.
+        *keys (str): Property names in precedence order.
+
+    Returns:
+        Any: The first nonempty value. Dictionary values prefer
+        ``referenceName`` and then ``name``; an empty string indicates no match.
+    """
+
     properties = source.get("properties") or {}
     for key in keys:
         value = properties.get(key)
@@ -328,6 +497,24 @@ def source_property(source, *keys):
 
 
 def aggregate_assets(data_sources, assets, source_index):
+    """Group assets by registration and calculate classification statistics.
+
+    Args:
+        data_sources (list[dict]): Registrations for which summaries are needed.
+        assets (Iterable[dict]): Catalog assets to match and count.
+        source_index (list[tuple[dict, list[str]]]): Registration locator index.
+
+    Returns:
+        tuple: ``(assets_by_source, summaries, unmatched_count)``, where the
+        first value maps source names to matched assets, the second maps source
+        names to count dictionaries, and the third counts unmatched assets.
+
+    Notes:
+        ``classification_assignments`` can exceed ``classified_assets`` because
+        one asset may have multiple classifications. Unclassified assets are
+        retained in summary counts but omitted from the detailed output sheet.
+    """
+
     assets_by_source = defaultdict(list)
     unmatched_count = 0
 
@@ -368,6 +555,17 @@ def aggregate_assets(data_sources, assets, source_index):
 
 
 def add_table(worksheet, name):
+    """Convert a populated worksheet range into a styled Excel table.
+
+    Args:
+        worksheet (openpyxl.worksheet.worksheet.Worksheet): Target worksheet.
+        name (str): Workbook-unique Excel table display name.
+
+    Notes:
+        Excel tables require at least one data row, so an empty worksheet gains
+        a placeholder ``No records found`` row before the table is created.
+    """
+
     if worksheet.max_row < 2:
         worksheet.append(["No records found"] + [""] * (worksheet.max_column - 1))
 
@@ -386,6 +584,13 @@ def add_table(worksheet, name):
 
 
 def format_worksheet(worksheet, widths):
+    """Apply shared header, body, view, and column-width formatting.
+
+    Args:
+        worksheet (openpyxl.worksheet.worksheet.Worksheet): Sheet to format.
+        widths (dict[str, int | float]): Excel column letters mapped to widths.
+    """
+
     worksheet.freeze_panes = "A2"
     worksheet.sheet_view.showGridLines = False
     worksheet.row_dimensions[1].height = 28
@@ -405,6 +610,16 @@ def format_worksheet(worksheet, widths):
 
 
 def sanitize_filename_component(value):
+    """Replace characters that are invalid in Windows filename components.
+
+    Args:
+        value (str): User-provided suffix or data-source name.
+
+    Returns:
+        str: Trimmed filename component with invalid characters replaced by
+        underscores and trailing periods or spaces removed.
+    """
+
     return re.sub(
         r'[<>:"/\\|?*\x00-\x1f]',
         "_",
@@ -413,6 +628,19 @@ def sanitize_filename_component(value):
 
 
 def report_output_path(output_directory, filename_suffix):
+    """Construct the base XLSX output path from CLI values.
+
+    Args:
+        output_directory (str | os.PathLike): Destination directory.
+        filename_suffix (str): Requested workbook filename without extension.
+
+    Returns:
+        pathlib.Path: Sanitized ``.xlsx`` output path.
+
+    Raises:
+        PurviewApiError: If sanitization removes the entire filename suffix.
+    """
+
     safe_filename_suffix = sanitize_filename_component(filename_suffix)
     if not safe_filename_suffix:
         raise PurviewApiError(
@@ -422,6 +650,16 @@ def report_output_path(output_directory, filename_suffix):
 
 
 def data_source_output_path(output_path, source_name):
+    """Prefix a base output filename with a sanitized data-source name.
+
+    Args:
+        output_path (str | os.PathLike): Base combined-report output path.
+        source_name (str): Registration name used as the filename prefix.
+
+    Returns:
+        pathlib.Path: Per-source path in the base path's directory.
+    """
+
     output_path = Path(output_path)
     safe_source_name = sanitize_filename_component(source_name)
     if not safe_source_name:
@@ -430,6 +668,20 @@ def data_source_output_path(output_path, source_name):
 
 
 def unique_output_path(output_path, used_output_paths):
+    """Reserve a case-insensitively unique output path for this run.
+
+    Args:
+        output_path (pathlib.Path): Preferred workbook path.
+        used_output_paths (set[str]): Absolute normalized paths already reserved.
+
+    Returns:
+        pathlib.Path: Preferred path or one suffixed with ``-2``, ``-3``, etc.
+
+    Notes:
+        This resolves collisions among generated names only. Existing files on
+        disk are intentionally overwritten by ``Workbook.save``.
+    """
+
     candidate = output_path
     suffix_number = 2
     normalized_path = str(candidate.absolute()).casefold()
@@ -451,6 +703,21 @@ def create_workbook(
     assets_by_source,
     summaries,
 ):
+    """Create and save a formatted Purview classification workbook.
+
+    Args:
+        output_path (str | os.PathLike): Destination XLSX path.
+        report_sources (list[dict]): Registrations included in this workbook.
+        report_scope (str): Human-readable scope stored in workbook metadata.
+        source_index (list[tuple[dict, list[str]]]): Registration locator index.
+        assets_by_source (Mapping[str, list[dict]]): Matched assets by source.
+        summaries (Mapping[str, dict]): Aggregate counts by source.
+
+    The workbook contains three sheets: registration metadata and totals,
+    classification counts by source, and one detail row per classified
+    asset/classification pair. Parent directories are created as needed.
+    """
+
     workbook = Workbook()
     data_sources_sheet = workbook.active
     data_sources_sheet.title = "Data Sources"
@@ -649,6 +916,19 @@ def create_workbook(
 
 
 def main():
+    """Run authentication, collection, aggregation, and report generation.
+
+    Returns:
+        int: Process exit code: ``0`` for success and ``1`` for an expected
+        Azure, Purview, filesystem, or configuration failure.
+
+    Side Effects:
+        Loads environment variables, calls Microsoft Purview APIs, prints
+        progress and warnings, creates output directories, and writes XLSX
+        files. ``--list-data-sources`` prints registrations and exits before
+        catalog retrieval.
+    """
+
     args = parse_args()
     load_dotenv(args.env_file)
     account_name = os.getenv("PURVIEW_ACCOUNT_NAME")
