@@ -1,13 +1,15 @@
 """Generate Excel reports of Microsoft Purview asset classifications.
 
-The script authenticates with :class:`azure.identity.DefaultAzureCredential`,
-retrieves registered data sources and catalog assets from the Microsoft Purview
-data-plane APIs, maps assets to registrations by normalized locator, and writes
-one combined workbook or one workbook per data source.
+The script authenticates with either
+:class:`azure.identity.DefaultAzureCredential` or
+:class:`azure.identity.ClientSecretCredential`, retrieves registered data
+sources and catalog assets from the Microsoft Purview data-plane APIs, maps
+assets to registrations by normalized locator, and writes one combined
+workbook or one workbook per data source.
 
 Configuration is read from an environment file. ``PURVIEW_ACCOUNT_NAME`` is
-required; Azure Identity environment variables are optional when another
-``DefaultAzureCredential`` source, such as Azure CLI, is available.
+required. Service-principal authentication also requires
+``AZURE_TENANT_ID``, ``AZURE_CLIENT_ID``, and ``AZURE_CLIENT_SECRET``.
 """
 
 import argparse
@@ -21,7 +23,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from azure.core.exceptions import AzureError
-from azure.identity import DefaultAzureCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -32,12 +34,14 @@ API_VERSION = "2023-09-01"
 DEFAULT_ENV_FILE = "purview.env"
 DEFAULT_OUTPUT_DIRECTORY = "reports"
 DEFAULT_FILENAME_SUFFIX = "classifications"
+AUTHENTICATION_MODES = ("azure-credential", "service-principal")
 MODIFIED_TIME_RANGES = {
     "24h": "LAST_24H",
     "7d": "LAST_7D",
     "30d": "LAST_30D",
 }
 REQUEST_TIMEOUT_SECONDS = 60
+ENTITY_GUID_BATCH_SIZE = 25
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 SELECTED_FILL = PatternFill("solid", fgColor="D9EAD3")
 HEADER_FONT = Font(name="Arial", color="FFFFFF", bold=True)
@@ -111,6 +115,17 @@ def parse_args():
         help=f"Environment file containing PURVIEW_ACCOUNT_NAME (default: {DEFAULT_ENV_FILE}).",
     )
     parser.add_argument(
+        "--authentication-mode",
+        choices=AUTHENTICATION_MODES,
+        default="azure-credential",
+        help=(
+            "Authentication method: azure-credential uses DefaultAzureCredential "
+            "(Azure CLI, managed identity, developer tools, and other supported "
+            "credentials); service-principal uses AZURE_TENANT_ID, AZURE_CLIENT_ID, "
+            "and AZURE_CLIENT_SECRET (default: azure-credential)."
+        ),
+    )
+    parser.add_argument(
         "--qualified-name-prefix",
         help=(
             "Optional qualifiedName prefix used to identify assets for the selected "
@@ -144,6 +159,47 @@ def parse_args():
     if args.file_per_data_source and not args.data_source:
         parser.error("--file-per-data-source requires --data-source.")
     return args
+
+
+def create_credential(authentication_mode):
+    """Create the Azure credential selected for Purview API access.
+
+    Args:
+        authentication_mode (str): One of ``AUTHENTICATION_MODES``.
+
+    Returns:
+        azure.core.credentials.TokenCredential: Configured Azure credential.
+
+    Raises:
+        PurviewApiError: If service-principal configuration is incomplete or
+            the authentication mode is unsupported.
+    """
+
+    if authentication_mode == "azure-credential":
+        return DefaultAzureCredential()
+    if authentication_mode != "service-principal":
+        raise PurviewApiError(
+            f"Unsupported authentication mode: {authentication_mode}"
+        )
+
+    variable_names = (
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+    )
+    values = {name: os.getenv(name) for name in variable_names}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise PurviewApiError(
+            "Service-principal authentication requires these environment "
+            f"variables: {', '.join(missing)}."
+        )
+
+    return ClientSecretCredential(
+        tenant_id=values["AZURE_TENANT_ID"],
+        client_id=values["AZURE_CLIENT_ID"],
+        client_secret=values["AZURE_CLIENT_SECRET"],
+    )
 
 
 def request_json(session, method, url, headers, **kwargs):
@@ -252,6 +308,121 @@ def list_catalog_assets(
         continuation_token = response.get("continuationToken")
         if not continuation_token:
             break
+
+
+def atlas_entity_to_asset(entity):
+    """Convert an Atlas entity response into the report's asset shape.
+
+    Args:
+        entity (dict): Entity from ``entities`` or ``referredEntities``.
+
+    Returns:
+        dict: Normalized asset fields used by report generation.
+    """
+
+    attributes = entity.get("attributes") or {}
+    relationship_attributes = entity.get("relationshipAttributes") or {}
+    parent = {}
+    for relationship_name in (
+        "table",
+        "view",
+        "composeSchema",
+        "tabular_schema",
+    ):
+        relationship = relationship_attributes.get(relationship_name)
+        if isinstance(relationship, dict):
+            parent = relationship
+            break
+
+    type_name = entity.get("typeName", "")
+    return {
+        "name": (
+            attributes.get("name")
+            or entity.get("displayText")
+            or attributes.get("displayName")
+            or ""
+        ),
+        "id": entity.get("guid", ""),
+        "entityType": type_name,
+        "assetType": [type_name] if type_name else [],
+        "qualifiedName": attributes.get("qualifiedName", ""),
+        "classification": entity.get("classifications") or [],
+        "description": (
+            attributes.get("description")
+            or attributes.get("userDescription")
+            or attributes.get("comment")
+            or ""
+        ),
+        "collectionId": entity.get("collectionId", ""),
+        "dataType": attributes.get("dataType") or attributes.get("type") or "",
+        "parentName": parent.get("displayText", ""),
+        "parentGuid": parent.get("guid", ""),
+    }
+
+
+def list_classified_columns(
+    session,
+    endpoint,
+    headers,
+    assets,
+    batch_size=ENTITY_GUID_BATCH_SIZE,
+):
+    """Yield classified column entities from Atlas entity details.
+
+    Discovery search records do not reliably contain child columns. This
+    function retrieves matched entities in bulk and inspects both the requested
+    ``entities`` and their expanded ``referredEntities`` for classified
+    columns.
+
+    Args:
+        session (requests.Session): Authenticated HTTP session.
+        endpoint (str): Purview account endpoint without a trailing path.
+        headers (dict): Request headers accepted by the Purview API.
+        assets (Iterable[dict]): Matched discovery assets whose relationships
+            should be expanded.
+        batch_size (int): Maximum GUIDs requested per bulk API call.
+
+    Yields:
+        dict: Normalized classified column asset.
+    """
+
+    guids = sorted(
+        {
+            str(asset.get("id"))
+            for asset in assets
+            if asset.get("id") not in (None, "")
+        }
+    )
+    seen_columns = set()
+    url = f"{endpoint}/datamap/api/atlas/v2/entity/bulk"
+
+    for offset in range(0, len(guids), batch_size):
+        batch = guids[offset : offset + batch_size]
+        params = [
+            ("api-version", API_VERSION),
+            ("minExtInfo", "false"),
+            ("ignoreRelationships", "false"),
+        ]
+        params.extend(("guid", guid) for guid in batch)
+        response = request_json(
+            session,
+            "GET",
+            url,
+            headers,
+            params=params,
+        )
+        entities = list(response.get("entities") or [])
+        entities.extend((response.get("referredEntities") or {}).values())
+
+        for entity in entities:
+            asset = atlas_entity_to_asset(entity)
+            if not is_column_asset(asset) or not classification_names(asset):
+                continue
+            identity = asset.get("id") or asset.get("qualifiedName")
+            if not identity or identity in seen_columns:
+                continue
+            seen_columns.add(identity)
+            yield asset
 
 
 def normalize_locator(value):
@@ -458,16 +629,77 @@ def classification_names(asset):
     """
 
     names = set()
-    for classification in asset.get("classification") or []:
-        if isinstance(classification, str):
-            name = classification
-        elif isinstance(classification, dict):
-            name = classification.get("typeName") or classification.get("name")
-        else:
-            name = None
-        if name:
-            names.add(name)
+    for field_name in ("classification", "classifications"):
+        classifications = asset.get(field_name) or []
+        if not isinstance(classifications, (list, tuple, set)):
+            classifications = [classifications]
+        for classification in classifications:
+            if isinstance(classification, str):
+                name = classification
+            elif isinstance(classification, dict):
+                name = classification.get("typeName") or classification.get("name")
+            else:
+                name = None
+            if name:
+                names.add(name)
     return sorted(names, key=str.casefold)
+
+
+def asset_type_names(asset):
+    """Return the searchable entity and asset type names for an asset.
+
+    Args:
+        asset (dict): Catalog asset returned by discovery search.
+
+    Returns:
+        list[str]: Nonempty type names represented as strings.
+    """
+
+    values = [asset.get("entityType")]
+    asset_types = asset.get("assetType") or []
+    if isinstance(asset_types, list):
+        values.extend(asset_types)
+    else:
+        values.append(asset_types)
+    return [str(value) for value in values if value not in (None, "")]
+
+
+def is_column_asset(asset):
+    """Return whether Purview identifies an asset as a table-like column.
+
+    Purview type names vary by connector (for example ``azure_sql_column`` or
+    ``Database Column``), so entity and asset type names are matched on a
+    complete ``column`` or ``columns`` word rather than a connector-specific
+    allowlist.
+
+    Args:
+        asset (dict): Catalog asset returned by discovery search.
+
+    Returns:
+        bool: ``True`` when a type name contains a column type marker.
+    """
+
+    for name in asset_type_names(asset):
+        normalized_name = re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])",
+            "_",
+            name,
+        ).casefold()
+        if re.search(
+            r"(^|[^a-z0-9])columns?($|[^a-z0-9])",
+            normalized_name,
+        ):
+            return True
+    return False
+
+
+def formatted_asset_type(asset):
+    """Return asset type values formatted for an Excel cell."""
+
+    asset_type = asset.get("assetType") or []
+    if isinstance(asset_type, list):
+        return ", ".join(str(value) for value in asset_type)
+    return str(asset_type)
 
 
 def source_property(source, *keys):
@@ -552,6 +784,17 @@ def aggregate_assets(data_sources, assets, source_index):
         }
 
     return assets_by_source, summaries, unmatched_count
+
+
+def group_columns_by_source(columns, source_index):
+    """Map normalized Atlas column entities to registered data sources."""
+
+    columns_by_source = defaultdict(list)
+    for column in columns:
+        source = match_asset_to_source(column, source_index)
+        if source is not None:
+            columns_by_source[source.get("name", "")].append(column)
+    return columns_by_source
 
 
 def add_table(worksheet, name):
@@ -701,6 +944,7 @@ def create_workbook(
     report_scope,
     source_index,
     assets_by_source,
+    columns_by_source,
     summaries,
 ):
     """Create and save a formatted Purview classification workbook.
@@ -711,11 +955,14 @@ def create_workbook(
         report_scope (str): Human-readable scope stored in workbook metadata.
         source_index (list[tuple[dict, list[str]]]): Registration locator index.
         assets_by_source (Mapping[str, list[dict]]): Matched assets by source.
+        columns_by_source (Mapping[str, list[dict]]): Classified Atlas columns
+            by source.
         summaries (Mapping[str, dict]): Aggregate counts by source.
 
-    The workbook contains three sheets: registration metadata and totals,
-    classification counts by source, and one detail row per classified
-    asset/classification pair. Parent directories are created as needed.
+    The workbook contains four sheets: registration metadata and totals,
+    classification counts by source, one detail row per classified
+    asset/classification pair, and one detail row per classified
+    column/classification pair. Parent directories are created as needed.
     """
 
     workbook = Workbook()
@@ -723,6 +970,7 @@ def create_workbook(
     data_sources_sheet.title = "Data Sources"
     summary_sheet = workbook.create_sheet("Classification Summary")
     assets_sheet = workbook.create_sheet("Assets & Classifications")
+    columns_sheet = workbook.create_sheet("Column Classifications")
 
     data_sources_sheet.append(
         [
@@ -841,16 +1089,13 @@ def create_workbook(
             if not classifications:
                 continue
             for classification in classifications:
-                asset_type = asset.get("assetType") or []
-                if isinstance(asset_type, list):
-                    asset_type = ", ".join(str(value) for value in asset_type)
                 assets_sheet.append(
                     [
                         source_name,
                         asset.get("name", ""),
                         asset.get("id", ""),
                         asset.get("entityType", ""),
-                        asset_type,
+                        formatted_asset_type(asset),
                         asset.get("qualifiedName", ""),
                         classification,
                         asset.get("description", ""),
@@ -858,9 +1103,56 @@ def create_workbook(
                     ]
                 )
 
+    columns_sheet.append(
+        [
+            "Data Source",
+            "Column Name",
+            "Column GUID",
+            "Entity Type",
+            "Asset Type",
+            "Data Type",
+            "Parent Asset",
+            "Parent GUID",
+            "Column Qualified Name",
+            "Classification",
+            "Description",
+            "Collection ID",
+        ]
+    )
+    for source in sorted(
+        report_sources, key=lambda item: item.get("name", "").casefold()
+    ):
+        source_name = source.get("name", "")
+        column_assets = sorted(
+            columns_by_source[source_name],
+            key=lambda asset: (
+                str(asset.get("qualifiedName", "")).casefold(),
+                str(asset.get("name", "")).casefold(),
+            ),
+        )
+        for column in column_assets:
+            for classification in classification_names(column):
+                columns_sheet.append(
+                    [
+                        source_name,
+                        column.get("name", ""),
+                        column.get("id", ""),
+                        column.get("entityType", ""),
+                        formatted_asset_type(column),
+                        column.get("dataType", ""),
+                        column.get("parentName", ""),
+                        column.get("parentGuid", ""),
+                        column.get("qualifiedName", ""),
+                        classification,
+                        column.get("description", ""),
+                        column.get("collectionId", ""),
+                    ]
+                )
+
     add_table(data_sources_sheet, "DataSourcesTable")
     add_table(summary_sheet, "ClassificationSummaryTable")
     add_table(assets_sheet, "AssetsClassificationsTable")
+    add_table(columns_sheet, "ColumnClassificationsTable")
     format_worksheet(
         data_sources_sheet,
         {
@@ -886,6 +1178,23 @@ def create_workbook(
     )
     format_worksheet(
         assets_sheet,
+        {
+            "A": 28,
+            "B": 35,
+            "C": 38,
+            "D": 30,
+            "E": 30,
+            "F": 20,
+            "G": 35,
+            "H": 38,
+            "I": 70,
+            "J": 45,
+            "K": 55,
+            "L": 38,
+        },
+    )
+    format_worksheet(
+        columns_sheet,
         {
             "A": 28,
             "B": 35,
@@ -941,7 +1250,7 @@ def main():
 
     endpoint = f"https://{account_name}.purview.azure.com"
     try:
-        credential = DefaultAzureCredential()
+        credential = create_credential(args.authentication_mode)
         access_token = credential.get_token("https://purview.azure.net/.default").token
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1019,12 +1328,33 @@ def main():
                     args.modified_within,
                 )
             )
+            assets_by_source, summaries, unmatched_count = aggregate_assets(
+                data_sources,
+                assets,
+                source_index,
+            )
+            report_source_names = {
+                source.get("name", "") for source in report_sources
+            }
+            detail_assets = [
+                asset
+                for source_name in report_source_names
+                for asset in assets_by_source[source_name]
+            ]
+            print("Retrieving column classifications...")
+            classified_columns = list(
+                list_classified_columns(
+                    session,
+                    endpoint,
+                    headers,
+                    detail_assets,
+                )
+            )
+            columns_by_source = group_columns_by_source(
+                classified_columns,
+                source_index,
+            )
 
-        assets_by_source, summaries, unmatched_count = aggregate_assets(
-            data_sources,
-            assets,
-            source_index,
-        )
         base_output_path = report_output_path(
             args.output_directory,
             args.filename_suffix,
@@ -1047,6 +1377,7 @@ def main():
                     source_name,
                     source_index,
                     assets_by_source,
+                    columns_by_source,
                     summaries,
                 )
                 created_reports.append((source_name, output_path))
@@ -1057,6 +1388,7 @@ def main():
                 "ALL" if include_all_sources else selected_source.get("name", ""),
                 source_index,
                 assets_by_source,
+                columns_by_source,
                 summaries,
             )
             created_reports.append(
