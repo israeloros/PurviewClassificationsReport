@@ -19,6 +19,7 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from time import sleep
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -33,7 +34,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 API_VERSION = "2023-09-01"
 DEFAULT_ENV_FILE = "purview.env"
 DEFAULT_OUTPUT_DIRECTORY = "reports"
-DEFAULT_FILENAME_SUFFIX = "classifications"
+DEFAULT_FILENAME_PREFIX = "classifications"
 AUTHENTICATION_MODES = ("azure-credential", "service-principal")
 MODIFIED_TIME_RANGES = {
     "24h": "LAST_24H",
@@ -41,7 +42,23 @@ MODIFIED_TIME_RANGES = {
     "30d": "LAST_30D",
 }
 REQUEST_TIMEOUT_SECONDS = 60
-ENTITY_GUID_BATCH_SIZE = 25
+REQUEST_CONNECTION_ATTEMPTS = 3
+ENTITY_GUID_BATCH_SIZE = 100
+SOURCE_ENDPOINT_KEYS = (
+    "endpoint",
+    "serverEndpoint",
+    "serviceUrl",
+    "resourceUri",
+    "url",
+    "host",
+    "hostName",
+    "accountUri",
+    "webApiEndpoint",
+    "workspaceUrl",
+    "dedicatedSqlEndpoint",
+    "serverlessSqlEndpoint",
+    "server",
+)
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 SELECTED_FILL = PatternFill("solid", fgColor="D9EAD3")
 HEADER_FONT = Font(name="Arial", color="FFFFFF", bold=True)
@@ -86,11 +103,11 @@ def parse_args():
         help="Enumerate registered Purview data sources on screen and exit.",
     )
     parser.add_argument(
-        "--filename-suffix",
-        default=DEFAULT_FILENAME_SUFFIX,
+        "--filename-prefix",
+        default=DEFAULT_FILENAME_PREFIX,
         help=(
-            "Filename suffix placed before the .xlsx extension "
-            f"(default: {DEFAULT_FILENAME_SUFFIX})."
+            "Filename prefix used before the .xlsx extension "
+            f"(default: {DEFAULT_FILENAME_PREFIX})."
         ),
     )
     parser.add_argument(
@@ -203,7 +220,7 @@ def create_credential(authentication_mode):
 
 
 def request_json(session, method, url, headers, **kwargs):
-    """Send an HTTP request and decode its JSON response.
+    """Send a read-only API request with bounded connection-error retries.
 
     Args:
         session (requests.Session): Session used to reuse HTTP connections.
@@ -221,13 +238,30 @@ def request_json(session, method, url, headers, **kwargs):
     """
 
     try:
-        response = session.request(
-            method,
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            **kwargs,
-        )
+        for attempt in range(REQUEST_CONNECTION_ATTEMPTS):
+            try:
+                response = session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    **kwargs,
+                )
+                break
+            except requests.ConnectionError as exc:
+                if (
+                    isinstance(exc, requests.exceptions.SSLError)
+                    or method.upper() not in ("GET", "POST")
+                    or attempt == REQUEST_CONNECTION_ATTEMPTS - 1
+                ):
+                    raise
+                delay = 2 ** attempt
+                print(
+                    f"Connection interrupted; retrying {method} request "
+                    f"({attempt + 2}/{REQUEST_CONNECTION_ATTEMPTS}) in {delay}s.",
+                    file=sys.stderr,
+                )
+                sleep(delay)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
@@ -328,6 +362,7 @@ def atlas_entity_to_asset(entity):
         "view",
         "composeSchema",
         "tabular_schema",
+        "referredSchema",
     ):
         relationship = relationship_attributes.get(relationship_name)
         if isinstance(relationship, dict):
@@ -354,7 +389,12 @@ def atlas_entity_to_asset(entity):
             or ""
         ),
         "collectionId": entity.get("collectionId", ""),
-        "dataType": attributes.get("dataType") or attributes.get("type") or "",
+        "dataType": (
+            attributes.get("dataType")
+            or attributes.get("type")
+            or attributes.get("logicalType")
+            or ""
+        ),
         "parentName": parent.get("displayText", ""),
         "parentGuid": parent.get("guid", ""),
     }
@@ -370,9 +410,15 @@ def list_classified_columns(
     """Yield classified column entities from Atlas entity details.
 
     Discovery search records do not reliably contain child columns. This
-    function retrieves matched entities in bulk and inspects both the requested
-    ``entities`` and their expanded ``referredEntities`` for classified
-    columns.
+    function retrieves matched entities in bulk, follows schema and column
+    references, and inspects both ``entities`` and ``referredEntities``.
+    Relationship references are fetched explicitly because extended entity
+    responses do not necessarily expand attached schemas or column details.
+    ``isIncomplete`` describes stored Atlas metadata, not request success.
+    Available classifications and relationships are processed regardless of
+    this flag; missing requested entities and API failures remain errors.
+    Minimal extended information avoids redundant expansion; timed-out batches
+    are retried at a smaller size without discarding any requested GUIDs.
 
     Args:
         session (requests.Session): Authenticated HTTP session.
@@ -386,42 +432,96 @@ def list_classified_columns(
         dict: Normalized classified column asset.
     """
 
-    guids = sorted(
-        {
-            str(asset.get("id"))
-            for asset in assets
-            if asset.get("id") not in (None, "")
-        }
-    )
-    seen_columns = set()
+    if batch_size < 1:
+        raise PurviewApiError("The entity GUID batch size must be positive.")
+
+    pending_guids = {
+        str(asset.get("id"))
+        for asset in assets
+        if asset.get("id") not in (None, "")
+    }
+    requested_guids = set()
+    entities_by_guid = {}
     url = f"{endpoint}/datamap/api/atlas/v2/entity/bulk"
 
-    for offset in range(0, len(guids), batch_size):
-        batch = guids[offset : offset + batch_size]
+    while pending_guids:
+        batch = sorted(pending_guids)[:batch_size]
+        pending_guids.difference_update(batch)
+        requested_guids.update(batch)
         params = [
             ("api-version", API_VERSION),
-            ("minExtInfo", "false"),
+            ("minExtInfo", "true"),
             ("ignoreRelationships", "false"),
         ]
         params.extend(("guid", guid) for guid in batch)
-        response = request_json(
-            session,
-            "GET",
-            url,
-            headers,
-            params=params,
-        )
-        entities = list(response.get("entities") or [])
-        entities.extend((response.get("referredEntities") or {}).values())
+        try:
+            response = request_json(
+                session,
+                "GET",
+                url,
+                headers,
+                params=params,
+            )
+        except PurviewApiError as exc:
+            if not isinstance(exc.__cause__, requests.Timeout) or len(batch) == 1:
+                raise
+            batch_size = max(1, len(batch) // 2)
+            requested_guids.difference_update(batch)
+            pending_guids.update(batch)
+            print(
+                "Atlas entity batch timed out; retrying the same entities in "
+                f"smaller batches of {batch_size}.",
+                file=sys.stderr,
+            )
+            continue
+        primary_entities = response.get("entities") or []
+        referred_entities = list((response.get("referredEntities") or {}).values())
+        returned_entities = {
+            str(entity["guid"]): entity
+            for entity in referred_entities + primary_entities
+            if entity.get("guid")
+        }
+        for guid in batch:
+            entity = returned_entities.get(guid)
+            if entity is None:
+                raise PurviewApiError(
+                    f"Atlas did not return requested entity '{guid}' "
+                    "while retrieving column classifications."
+                )
 
-        for entity in entities:
-            asset = atlas_entity_to_asset(entity)
-            if not is_column_asset(asset) or not classification_names(asset):
-                continue
-            identity = asset.get("id") or asset.get("qualifiedName")
-            if not identity or identity in seen_columns:
-                continue
-            seen_columns.add(identity)
+        for guid, entity in returned_entities.items():
+            if guid in batch or guid not in entities_by_guid:
+                entities_by_guid[guid] = entity
+            for attributes_key in ("attributes", "relationshipAttributes"):
+                relationships = entity.get(attributes_key) or {}
+                for relationship_name in (
+                    "attachedSchema", "schema", "tabular_schema", "columns",
+                ):
+                    references = relationships.get(relationship_name) or []
+                    if isinstance(references, dict):
+                        references = [references]
+                    if not isinstance(references, list):
+                        continue
+                    for reference in references:
+                        if not isinstance(reference, dict):
+                            continue
+                        if (
+                            reference.get("entityStatus") == "DELETED"
+                            or reference.get("relationshipStatus") == "DELETED"
+                        ):
+                            continue
+                        child_guid = reference.get("guid")
+                        if child_guid and str(child_guid) not in requested_guids:
+                            pending_guids.add(str(child_guid))
+            if (
+                guid not in requested_guids
+                and is_column_asset(atlas_entity_to_asset(entity))
+            ):
+                pending_guids.add(guid)
+
+    for entity in entities_by_guid.values():
+        asset = atlas_entity_to_asset(entity)
+        if is_column_asset(asset) and classification_names(asset):
             yield asset
 
 
@@ -444,7 +544,12 @@ def normalize_locator(value):
 
     parsed = urlparse(text if "://" in text else f"//{text}")
     if parsed.netloc:
-        text = f"{parsed.netloc}{parsed.path}"
+        host = parsed.netloc
+        if parsed.scheme == "https" and host.endswith(":443"):
+            host = host[:-4]
+        elif parsed.scheme == "http" and host.endswith(":80"):
+            host = host[:-3]
+        text = f"{host}{parsed.path}"
 
     return text.strip("/")
 
@@ -474,7 +579,8 @@ def iter_nested_values(value, key_path=()):
 def data_source_locators(data_source):
     """Extract candidate asset locators from a data-source registration.
 
-    Known endpoint-like properties are searched recursively. For services that
+    Known endpoint-like properties, including Amazon S3's ``serviceUrl``, are
+    searched recursively. For services that
     register a child database, resource, or warehouse separately, that child
     name is also appended to the primary endpoint to create a more specific
     locator.
@@ -486,31 +592,52 @@ def data_source_locators(data_source):
         list[str]: Unique normalized locators, longest first.
     """
 
-    locator_keys = {
-        "endpoint",
-        "host",
-        "hostname",
-        "qualifiedname",
-        "resourceuri",
-        "serverendpoint",
-        "url",
-    }
+    locator_keys = {key.casefold() for key in SOURCE_ENDPOINT_KEYS}
+    locator_keys.update(("qualifiedname", "resourceid", "metastoreid", "additionalhosts"))
     locators = set()
 
     for key_path, value in iter_nested_values(data_source.get("properties", {})):
         if key_path and key_path[-1].lower() in locator_keys:
             locator = normalize_locator(value)
+            if (
+                data_source.get("kind") in ("Fabric", "PowerBI")
+                and locator in (
+                    "api.powerbi.com", "app.powerbi.com", "app.fabric.microsoft.com",
+                )
+            ):
+                continue
             if locator:
                 locators.add(locator)
+                if key_path[-1].casefold() == "webapiendpoint":
+                    parsed = urlparse(value)
+                    if parsed.netloc:
+                        locators.add(normalize_locator(parsed.netloc))
+                if (
+                    key_path[-1].casefold() == "serverendpoint"
+                    and data_source.get("kind") in (
+                        "AzureSqlDatabaseManagedInstance", "SqlServerDatabase",
+                    )
+                    and re.fullmatch(r"[^/,]+,\d+", locator)
+                ):
+                    locators.add(locator.rsplit(",", 1)[0])
+                storage_host = re.fullmatch(
+                    r"([^.]+)\.(?:blob|dfs|file)\.(core\.[^/]+)", locator
+                )
+                if storage_host:
+                    locators.add(f"{storage_host[1]}.{storage_host[2]}")
 
     properties = data_source.get("properties") or {}
-    endpoint = source_property(
-        data_source,
-        "endpoint",
-        "serverEndpoint",
-        "resourceUri",
-        "url",
-    )
+    endpoint = source_property(data_source, *SOURCE_ENDPOINT_KEYS)
+    if data_source.get("kind") == "AzureSynapseWorkspace":
+        for key in ("dedicatedSqlEndpoint", "serverlessSqlEndpoint"):
+            sql_endpoint = properties.get(key)
+            if sql_endpoint:
+                workspace_host = normalize_locator(sql_endpoint)
+                if workspace_host.endswith(".sql.azuresynapse.net"):
+                    workspace_host = workspace_host.removesuffix(".sql.azuresynapse.net")
+                    if key == "serverlessSqlEndpoint":
+                        workspace_host = workspace_host.removesuffix("-ondemand")
+                    locators.add(f"{workspace_host}.azuresynapse.net")
     for child_name_key in ("databaseName", "resourceName", "warehouseName"):
         child_name = properties.get(child_name_key)
         if endpoint and isinstance(child_name, str) and child_name.strip():
@@ -585,6 +712,105 @@ def build_source_index(data_sources, selected_name=None, selected_prefix=None):
             and item[0].get("name", "").casefold() != selected_name.casefold()
         ),
     )
+
+
+def add_fabric_workspace_locators(session, endpoint, headers, assets, source_index):
+    """Resolve Fabric/Power BI workspace URLs against registered tenant IDs.
+
+    Public application hosts are shared by every tenant, so they cannot safely
+    identify a registration. Only workspace roots whose Atlas tenant ID matches
+    exactly one registration are added, for both application URL formats.
+    """
+
+    tenant_sources = defaultdict(list)
+    for source, locators in source_index:
+        if source.get("kind") in ("Fabric", "PowerBI"):
+            tenant = source_property(source, "tenant", "tenantId")
+            if isinstance(tenant, str) and tenant:
+                tenant_sources[tenant.casefold()].append((source, locators))
+    if not tenant_sources:
+        return source_index
+
+    workspace_paths = set()
+    for asset in assets:
+        parsed = urlparse(asset.get("qualifiedName") or "")
+        if parsed.hostname in ("app.fabric.microsoft.com", "app.powerbi.com"):
+            workspace_path = re.match(r"(/groups/[^/]+)(?:/|$)", parsed.path)
+            if workspace_path:
+                workspace_paths.add(workspace_path[1])
+    workspace_assets = [
+        asset for asset in assets
+        if asset.get("entityType") in ("fabric_workspace", "powerbi_workspace")
+    ]
+    known_paths = {
+        urlparse(asset.get("qualifiedName") or "").path.rstrip("/")
+        for asset in workspace_assets
+    }
+    # A modified-time filter can omit an unchanged parent workspace.
+    if workspace_paths - known_paths:
+        continuation_token = None
+        while True:
+            body = {
+                "keywords": None,
+                "limit": 1000,
+                "filter": {"or": [
+                    {"entityType": "fabric_workspace"},
+                    {"entityType": "powerbi_workspace"},
+                ]},
+            }
+            if continuation_token:
+                body["continuationToken"] = continuation_token
+            response = request_json(
+                session, "POST",
+                f"{endpoint}/datamap/api/search/query?api-version={API_VERSION}",
+                headers, json=body,
+            )
+            workspace_assets.extend(
+                asset for asset in response.get("value") or []
+                if urlparse(asset.get("qualifiedName") or "").path.rstrip("/")
+                in workspace_paths
+            )
+            continuation_token = response.get("continuationToken")
+            if not continuation_token:
+                break
+    workspace_guids = sorted({
+        str(asset["id"]) for asset in workspace_assets if asset.get("id")
+    })
+    for offset in range(0, len(workspace_guids), ENTITY_GUID_BATCH_SIZE):
+        batch = workspace_guids[offset : offset + ENTITY_GUID_BATCH_SIZE]
+        response = request_json(
+            session, "GET", f"{endpoint}/datamap/api/atlas/v2/entity/bulk", headers,
+            params=[("api-version", API_VERSION), ("minExtInfo", "true")]
+            + [("guid", guid) for guid in batch],
+        )
+        entities = {
+            str(entity["guid"]): entity
+            for entity in response.get("entities") or [] if entity.get("guid")
+        }
+        for guid in batch:
+            if guid not in entities:
+                raise PurviewApiError(
+                    f"Atlas did not return requested workspace '{guid}' "
+                    "while resolving registered tenants."
+                )
+            attributes = entities[guid].get("attributes") or {}
+            tenant_id = attributes.get("tenantId")
+            candidates = tenant_sources.get(str(tenant_id).casefold(), [])
+            if len(candidates) != 1:
+                continue
+            parsed = urlparse(attributes.get("qualifiedName") or "")
+            if parsed.hostname not in ("app.fabric.microsoft.com", "app.powerbi.com"):
+                continue
+            workspace_path = re.fullmatch(r"/groups/([^/]+)/?", parsed.path)
+            if workspace_path is None:
+                continue
+            _, locators = candidates[0]
+            for host in ("app.fabric.microsoft.com", "app.powerbi.com"):
+                locator = normalize_locator(f"{host}/groups/{workspace_path[1]}")
+                if locator not in locators:
+                    locators.append(locator)
+            locators.sort(key=len, reverse=True)
+    return source_index
 
 
 def match_asset_to_source(asset, source_index):
@@ -737,9 +963,10 @@ def aggregate_assets(data_sources, assets, source_index):
         source_index (list[tuple[dict, list[str]]]): Registration locator index.
 
     Returns:
-        tuple: ``(assets_by_source, summaries, unmatched_count)``, where the
+        tuple: ``(assets_by_source, summaries, unmatched_assets)``, where the
         first value maps source names to matched assets, the second maps source
-        names to count dictionaries, and the third counts unmatched assets.
+        names to count dictionaries, and the third contains unmatched assets
+        for coverage reporting.
 
     Notes:
         ``classification_assignments`` can exceed ``classified_assets`` because
@@ -748,12 +975,12 @@ def aggregate_assets(data_sources, assets, source_index):
     """
 
     assets_by_source = defaultdict(list)
-    unmatched_count = 0
+    unmatched_assets = []
 
     for asset in assets:
         source = match_asset_to_source(asset, source_index)
         if source is None:
-            unmatched_count += 1
+            unmatched_assets.append(asset)
             continue
         assets_by_source[source.get("name", "")].append(asset)
 
@@ -783,7 +1010,7 @@ def aggregate_assets(data_sources, assets, source_index):
             "classification_counts": classification_counts,
         }
 
-    return assets_by_source, summaries, unmatched_count
+    return assets_by_source, summaries, unmatched_assets
 
 
 def group_columns_by_source(columns, source_index):
@@ -856,7 +1083,7 @@ def sanitize_filename_component(value):
     """Replace characters that are invalid in Windows filename components.
 
     Args:
-        value (str): User-provided suffix or data-source name.
+        value (str): User-provided filename prefix or data-source name.
 
     Returns:
         str: Trimmed filename component with invalid characters replaced by
@@ -870,26 +1097,26 @@ def sanitize_filename_component(value):
     ).strip(" .")
 
 
-def report_output_path(output_directory, filename_suffix):
+def report_output_path(output_directory, filename_prefix):
     """Construct the base XLSX output path from CLI values.
 
     Args:
         output_directory (str | os.PathLike): Destination directory.
-        filename_suffix (str): Requested workbook filename without extension.
+        filename_prefix (str): Requested workbook filename without extension.
 
     Returns:
         pathlib.Path: Sanitized ``.xlsx`` output path.
 
     Raises:
-        PurviewApiError: If sanitization removes the entire filename suffix.
+        PurviewApiError: If sanitization removes the entire filename prefix.
     """
 
-    safe_filename_suffix = sanitize_filename_component(filename_suffix)
-    if not safe_filename_suffix:
+    safe_filename_prefix = sanitize_filename_component(filename_prefix)
+    if not safe_filename_prefix:
         raise PurviewApiError(
-            "The filename suffix must contain at least one valid filename character."
+            "The filename prefix must contain at least one valid filename character."
         )
-    return Path(output_directory) / f"{safe_filename_suffix}.xlsx"
+    return Path(output_directory) / f"{safe_filename_prefix}.xlsx"
 
 
 def data_source_output_path(output_path, source_name):
@@ -946,6 +1173,7 @@ def create_workbook(
     assets_by_source,
     columns_by_source,
     summaries,
+    unmatched_assets=(),
 ):
     """Create and save a formatted Purview classification workbook.
 
@@ -958,11 +1186,15 @@ def create_workbook(
         columns_by_source (Mapping[str, list[dict]]): Classified Atlas columns
             by source.
         summaries (Mapping[str, dict]): Aggregate counts by source.
+        unmatched_assets (Iterable[dict]): Unmapped discovery records to retain
+            in a diagnostic sheet; omitted for single-source reports.
 
     The workbook contains four sheets: registration metadata and totals,
     classification counts by source, one detail row per classified
     asset/classification pair, and one detail row per classified
-    column/classification pair. Parent directories are created as needed.
+    column/classification pair. An additional diagnostic sheet preserves any
+    unmatched catalog assets supplied for an ALL-source report. Parent
+    directories are created as needed.
     """
 
     workbook = Workbook()
@@ -1009,13 +1241,7 @@ def create_workbook(
                 source_property(source, "resourceGroup"),
                 source_property(source, "subscriptionId"),
                 source_property(source, "resourceName"),
-                source_property(
-                    source,
-                    "endpoint",
-                    "serverEndpoint",
-                    "resourceUri",
-                    "url",
-                ),
+                source_property(source, *SOURCE_ENDPOINT_KEYS),
                 "\n".join(locator_map[source_name]),
                 summary["matched_assets"],
                 summary["classified_assets"],
@@ -1148,6 +1374,28 @@ def create_workbook(
                         column.get("collectionId", ""),
                     ]
                 )
+
+    if unmatched_assets:
+        unmatched_sheet = workbook.create_sheet("Unmatched Assets")
+        unmatched_sheet.append([
+            "Asset Name", "Asset GUID", "Entity Type", "Asset Type",
+            "Qualified Name", "Classification", "Collection ID", "Mapping Status",
+        ])
+        for asset in sorted(
+            unmatched_assets, key=lambda asset: str(asset.get("qualifiedName", "")).casefold()
+        ):
+            unmatched_sheet.append([
+                asset.get("name", ""), asset.get("id", ""),
+                asset.get("entityType", ""), formatted_asset_type(asset),
+                asset.get("qualifiedName", ""), ", ".join(classification_names(asset)),
+                asset.get("collectionId", ""),
+                "No matching registration locator; source may be unregistered or use a different endpoint.",
+            ])
+        add_table(unmatched_sheet, "UnmatchedAssetsTable")
+        format_worksheet(
+            unmatched_sheet,
+            {"A": 35, "B": 38, "C": 35, "D": 30, "E": 80, "F": 50, "G": 25, "H": 90},
+        )
 
     add_table(data_sources_sheet, "DataSourcesTable")
     add_table(summary_sheet, "ClassificationSummaryTable")
@@ -1305,6 +1553,19 @@ def main():
                 None if include_all_sources else selected_source.get("name", ""),
                 args.qualified_name_prefix,
             )
+            print("Retrieving catalog assets...")
+            assets = list(
+                list_catalog_assets(
+                    session,
+                    endpoint,
+                    headers,
+                    args.page_size,
+                    args.modified_within,
+                )
+            )
+            source_index = add_fabric_workspace_locators(
+                session, endpoint, headers, assets, source_index
+            )
             if selected_source is not None:
                 selected_locators = next(
                     locators
@@ -1317,18 +1578,7 @@ def main():
                         "matched to asset qualified names. Rerun with "
                         "--qualified-name-prefix."
                     )
-
-            print("Retrieving catalog assets...")
-            assets = list(
-                list_catalog_assets(
-                    session,
-                    endpoint,
-                    headers,
-                    args.page_size,
-                    args.modified_within,
-                )
-            )
-            assets_by_source, summaries, unmatched_count = aggregate_assets(
+            assets_by_source, summaries, unmatched_assets = aggregate_assets(
                 data_sources,
                 assets,
                 source_index,
@@ -1357,7 +1607,7 @@ def main():
 
         base_output_path = report_output_path(
             args.output_directory,
-            args.filename_suffix,
+            args.filename_prefix,
         )
         created_reports = []
         if args.file_per_data_source:
@@ -1379,6 +1629,7 @@ def main():
                     assets_by_source,
                     columns_by_source,
                     summaries,
+                    unmatched_assets if include_all_sources else (),
                 )
                 created_reports.append((source_name, output_path))
         else:
@@ -1390,6 +1641,7 @@ def main():
                 assets_by_source,
                 columns_by_source,
                 summaries,
+                unmatched_assets if include_all_sources else (),
             )
             created_reports.append(
                 (
@@ -1421,11 +1673,11 @@ def main():
                 f"Created {created_reports[0][1].resolve()} with "
                 f"{report_asset_count} assets for {report_scope}."
             )
-        if unmatched_count:
+        if include_all_sources and unmatched_assets:
             print(
-                f"Warning: {unmatched_count} catalog assets could not be mapped to a "
-                "registered data source using registration endpoint metadata.",
-                file=sys.stderr,
+                f"Coverage: {len(unmatched_assets)} catalog assets have no matching "
+                "registration locator and are listed in the Unmatched Assets "
+                "worksheet for review."
             )
         return 0
     except (AzureError, PurviewApiError, OSError) as exc:

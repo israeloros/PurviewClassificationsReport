@@ -4,7 +4,7 @@
 Microsoft Purview data classifications to registered data sources. It queries
 the Purview Data Map (scan and catalog search APIs), matches catalog assets to
 registered data source registrations using endpoint/qualified-name metadata,
-and produces a workbook with four sheets:
+and produces a workbook with four report sheets:
 
 - **Data Sources** — registered sources in scope, with location, resource
   group, subscription, endpoint, match locators, and asset/classification
@@ -17,7 +17,18 @@ and produces a workbook with four sheets:
   asset, with column name, GUID, entity/data type, parent asset, qualified
   name, description, and collection ID. Column details are expanded through
   the Atlas entity API because discovery search results do not reliably
-  include child columns.
+  include child columns. Schema and column references (including S3 attached
+  schemas) are followed explicitly in batches rather than relying on a single
+  entity response to contain every column.
+  Entity details are requested in batches of up to 100 GUIDs with minimal
+  extended information; timed-out batches are retried at smaller sizes without
+  dropping entities. Interrupted connections are retried up to three total
+  attempts with bounded backoff; exhausted retries remain errors.
+
+For `--data-source ALL`, an additional **Unmatched Assets** sheet is included
+when catalog records cannot be associated with a registration. It preserves
+their qualified names, entity types, classifications, and collection IDs rather
+than dropping them or assigning them to an unrelated source.
 
 ## Requirements
 
@@ -211,7 +222,7 @@ python PurviewClassificationsReport.py [options]
 |---|---|
 | `--data-source <name>` | Registered data source name to report on, or `ALL` for every registered source. Mutually exclusive with `--list-data-sources`. |
 | `--list-data-sources` | List registered data source names on screen and exit. |
-| `--filename-suffix <suffix>` | Filename suffix placed before the `.xlsx` extension (default: `classifications`). |
+| `--filename-prefix <prefix>` | Filename prefix used before the `.xlsx` extension (default: `classifications`). |
 | `--output-directory <path>` | Directory where generated files are stored (default: `reports`). |
 | `--file-per-data-source` | Generate a separate workbook for each data source in scope and prefix each filename with its data source name. Requires `--data-source`. |
 | `--env-file <path>` | Environment file to load (default: `purview.env`). |
@@ -264,10 +275,10 @@ This creates files such as `reports\SqlServer-Prod-classifications.xlsx`. Data
 source characters that are invalid in Windows filenames are replaced with
 underscores.
 
-Use a custom output directory and filename suffix:
+Use a custom output directory and filename prefix:
 
 ```powershell
-python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --output-directory "exports" --filename-suffix "classification-inventory"
+python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --output-directory "exports" --filename-prefix "classification-inventory"
 ```
 
 This creates files such as
@@ -306,10 +317,29 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Notes
 
-- If the script reports assets it couldn't match to a registered data source,
-  it prints a warning with the unmatched count; consider `--qualified-name-prefix`
-  for that source.
+- Amazon S3 registrations expose their endpoint as `properties.serviceUrl`
+  (for example, `s3://iodemodata`). The script uses this metadata automatically
+  to match bucket assets and their columns; no `--qualified-name-prefix` is
+  needed when this field is populated.
+- Matching recognizes connector-specific metadata such as Cosmos DB's
+  `accountUri`, Dataverse's `webApiEndpoint`, Databricks' `workspaceUrl` and
+  `metastoreId`, Synapse SQL endpoints/resource IDs, and MongoDB's `server`.
+  Default HTTP(S) ports, SQL managed-instance port notation, and Dataverse API
+  paths are normalized for matching.
+- Fabric/Power BI application URLs are mapped by workspace and verified Atlas
+  `tenantId`, not by a shared public hostname or collection. Unchanged workspace
+  parents can be resolved even when `--modified-within` filters the report.
+- Catalogs can contain lineage-only assets, old endpoints, or sources that are
+  no longer registered. An ALL-source report prints a coverage count and retains
+  those records in **Unmatched Assets** for review. Single-source reports do not
+  report unrelated account-wide coverage gaps. Use `--qualified-name-prefix`
+  for a named registration when its assets use a different endpoint.
 - `--modified-within` filters on the Purview catalog asset's `modifiedTime`.
   It does not represent the time when an individual classification was assigned.
+- Atlas's `isIncomplete` flag describes stored entity metadata, not a failed
+  API call or proof that column classifications are missing. The script follows
+  schema/column relationships and retrieves classifications regardless of this
+  flag. Missing requested entities and API request failures still stop report
+  generation.
 - The generated workbook opens in Excel with filterable tables, frozen header
   rows, and styled headers on each sheet.
