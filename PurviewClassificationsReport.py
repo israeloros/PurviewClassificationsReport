@@ -162,8 +162,9 @@ def parse_args():
         choices=MODIFIED_TIME_RANGES,
         metavar="{24h,7d,30d}",
         help=(
-            "Only include catalog assets modified within the previous 24 hours, "
-            "7 days, or 30 days."
+            "Only include assets updated in the Purview catalog within the previous "
+            "24 hours, 7 days, or 30 days (not source-system modification time "
+            "or individual classification assignment time)."
         ),
     )
     args = parser.parse_args()
@@ -318,8 +319,8 @@ def list_catalog_assets(
         dict: One catalog asset from each paginated search response.
 
     Notes:
-        The modified-time filter applies to the asset, not to the time at which
-        a classification was assigned.
+        The filter uses the catalog system updateTime, not a source-system
+        modifiedTime attribute or the time a classification was assigned.
     """
 
     url = f"{endpoint}/datamap/api/search/query?api-version={API_VERSION}"
@@ -329,9 +330,7 @@ def list_catalog_assets(
         body = {"keywords": None, "limit": page_size}
         if modified_within:
             body["filter"] = {
-                "attributeName": "modifiedTime",
-                "operator": "timerange",
-                "attributeValue": MODIFIED_TIME_RANGES[modified_within],
+                "updateTime": MODIFIED_TIME_RANGES[modified_within],
             }
         if continuation_token:
             body["continuationToken"] = continuation_token

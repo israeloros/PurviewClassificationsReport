@@ -357,6 +357,7 @@ class FabricWorkspaceMatchingTests(unittest.TestCase):
         self.assertIs(report.match_asset_to_source(asset, index), self.source)
         query = request.call_args_list[0].kwargs["json"]
         self.assertNotIn("timerange", str(query))
+        self.assertNotIn("updateTime", str(query))
         self.assertEqual(request.call_args_list[1].kwargs["json"]["continuationToken"], "next-page")
 
     def test_missing_workspace_details_remain_an_error(self):

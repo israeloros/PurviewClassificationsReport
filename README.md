@@ -229,7 +229,7 @@ python PurviewClassificationsReport.py [options]
 | `--authentication-mode <azure-credential\|service-principal>` | Use the Azure Identity default credential chain or the service principal configured in the environment file (default: `azure-credential`). |
 | `--qualified-name-prefix <prefix>` | Optional `qualifiedName` prefix to match assets when the registration has no usable endpoint metadata. Requires a specific `--data-source` (not `ALL`). |
 | `--page-size <1-1000>` | Number of catalog search results per request (default: 1000). |
-| `--modified-within <24h\|7d\|30d>` | Only include catalog assets modified within the previous 24 hours, 7 days, or 30 days. |
+| `--modified-within <24h\|7d\|30d>` | Only include assets updated in the Purview catalog within the previous 24 hours, 7 days, or 30 days, using catalog `updateTime`. |
 
 ### Examples
 
@@ -334,8 +334,12 @@ This project is licensed under the [MIT License](LICENSE).
   those records in **Unmatched Assets** for review. Single-source reports do not
   report unrelated account-wide coverage gaps. Use `--qualified-name-prefix`
   for a named registration when its assets use a different endpoint.
-- `--modified-within` filters on the Purview catalog asset's `modifiedTime`.
-  It does not represent the time when an individual classification was assigned.
+- `--modified-within` filters on the Purview catalog entity's system `updateTime`
+  using the discovery API's [system-time filter](https://learn.microsoft.com/en-us/rest/api/purview/datamapdataplane/discovery/query?view=rest-purview-datamapdataplane-2023-09-01#discovery_query_systemtime).
+  The source-system `attributes.modifiedTime` can remain unchanged after catalog
+  edits and is not used. The report shows current classifications on recently
+  updated assets, including their classified columns; it does not restrict rows
+  to classifications assigned during that window.
 - Atlas's `isIncomplete` flag describes stored entity metadata, not a failed
   API call or proof that column classifications are missing. The script follows
   schema/column relationships and retrieves classifications regardless of this
