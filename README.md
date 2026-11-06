@@ -114,8 +114,9 @@ For local execution with Azure CLI credentials:
    the login steps.
 6. Ask a Purview **Collection Admin** to assign your signed-in user the
    **Data Reader** and **Data Source Administrator** roles described above.
-7. For Azure credential authentication, `purview.env` only needs these three
-   settings:
+7. For Azure CLI authentication, only `PURVIEW_ACCOUNT_NAME` is required in
+   `purview.env`. You can also keep the tenant and subscription IDs there as
+   references for the login commands above:
 
    ```dotenv
    PURVIEW_ACCOUNT_NAME="<purview-account-name>"
@@ -191,17 +192,18 @@ default, or any file passed via `--env-file`.
    | Variable | Required | Description |
    |---|---|---|
    | `PURVIEW_ACCOUNT_NAME` | Yes | Name of the Purview account (used to build `https://<name>.purview.azure.com`). |
-   | `AZURE_TENANT_ID` | Yes | Entra ID tenant containing the Purview account. |
+   | `AZURE_TENANT_ID` | If using a service principal | Entra ID tenant for authentication. Also useful as a reference for `az login --tenant` when using Azure CLI credentials. |
    | `AZURE_CLIENT_ID` | If using a service principal | App registration (client) ID. |
    | `AZURE_CLIENT_SECRET` | If using a service principal | App registration client secret. |
-   | `AZURE_SUBSCRIPTION_ID` | Yes | Subscription containing the Purview account; used when selecting the Azure CLI subscription. |
+   | `AZURE_SUBSCRIPTION_ID` | No | Reference for selecting the Azure CLI subscription. The script does not read this variable. |
 
    With `--authentication-mode azure-credential`, the script uses
    `DefaultAzureCredential` to select an available Azure identity. The file
-   should contain only `PURVIEW_ACCOUNT_NAME`, `AZURE_TENANT_ID`, and
-   `AZURE_SUBSCRIPTION_ID`; omit `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`.
-   With `--authentication-mode service-principal`, add both
-   service-principal variables.
+   only requires `PURVIEW_ACCOUNT_NAME` for an existing Azure CLI login;
+   `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` can be kept as references.
+   Omit `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` for Azure CLI authentication.
+   With `--authentication-mode service-principal`, include `AZURE_TENANT_ID`,
+   `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`.
 
 > ⚠️ **Security note:** `purview.env` holds live secrets once configured.
 > Keep it out of source control (add it to `.gitignore`), never share it, and
@@ -222,14 +224,41 @@ python PurviewClassificationsReport.py [options]
 |---|---|
 | `--data-source <name>` | Registered data source name to report on, or `ALL` for every registered source. Mutually exclusive with `--list-data-sources`. |
 | `--list-data-sources` | List registered data source names on screen and exit. |
-| `--filename-prefix <prefix>` | Filename prefix used before the `.xlsx` extension (default: `classifications`). |
-| `--output-directory <path>` | Directory where generated files are stored (default: `reports`). |
+| `--filename-prefix <prefix>` | Workbook filename without the `.xlsx` extension (default: `classifications`). With `--file-per-data-source`, the source name is prepended. |
+| `--output-directory <path>` | Directory where generated files are stored (default: `reports`). Created automatically if missing; relative paths are resolved from the current working directory. |
 | `--file-per-data-source` | Generate a separate workbook for each data source in scope and prefix each filename with its data source name. Requires `--data-source`. |
 | `--env-file <path>` | Environment file to load (default: `purview.env`). |
 | `--authentication-mode <azure-credential\|service-principal>` | Use the Azure Identity default credential chain or the service principal configured in the environment file (default: `azure-credential`). |
-| `--qualified-name-prefix <prefix>` | Optional `qualifiedName` prefix to match assets when the registration has no usable endpoint metadata. Requires a specific `--data-source` (not `ALL`). |
+| `--qualified-name-prefix <prefix>` | Additional asset-matching locator for a source whose endpoint metadata is missing or does not match catalog qualified names. Does not change output filenames. Requires a specific `--data-source` (not `ALL`). |
 | `--page-size <1-1000>` | Number of catalog search results per request (default: 1000). |
 | `--modified-within <24h\|7d\|30d>` | Only include assets updated in the Purview catalog within the previous 24 hours, 7 days, or 30 days, using catalog `updateTime`. |
+
+Specify either `--data-source` or `--list-data-sources`.
+
+### Choosing output folders and filenames
+
+`--output-directory` and `--filename-prefix` are independent: use either or
+both. Without `--file-per-data-source`, the output path is
+`<output-directory>\<filename-prefix>.xlsx`. The script adds `.xlsx`, so do
+not include the extension in the prefix.
+
+| Output choices for `--data-source azsql-ncus` | Resulting file |
+|---|---|
+| Neither option | `reports\classifications.xlsx` |
+| `--output-directory azsqldb-ncus` | `azsqldb-ncus\classifications.xlsx` |
+| `--filename-prefix classification-report` | `reports\classification-report.xlsx` |
+| `--output-directory azsqldb-ncus --filename-prefix classification-report` | `azsqldb-ncus\classification-report.xlsx` |
+| Both options above plus `--file-per-data-source` | `azsqldb-ncus\azsql-ncus-classification-report.xlsx` |
+
+**`--qualified-name-prefix` is not a filename option.** It supplies a Purview
+asset locator, such as a storage URL, for source matching. For example,
+`--qualified-name-prefix classification-report` leaves the output filename
+as `classifications.xlsx` unless you also set `--filename-prefix`.
+
+Invalid Windows filename characters in filename prefixes and data source
+names are replaced with underscores; surrounding spaces and periods are
+trimmed. Existing files at the resulting path are overwritten. Use distinct
+filename prefixes to retain reports for different time windows.
 
 ### Examples
 
@@ -275,7 +304,40 @@ This creates files such as `reports\SqlServer-Prod-classifications.xlsx`. Data
 source characters that are invalid in Windows filenames are replaced with
 underscores.
 
-Use a custom output directory and filename prefix:
+Change only the output directory, keeping the default filename:
+
+```powershell
+python PurviewClassificationsReport.py --data-source azsql-ncus --output-directory azsqldb-ncus
+```
+
+This creates `azsqldb-ncus\classifications.xlsx`.
+
+Change only the filename, keeping the default output directory:
+
+```powershell
+python PurviewClassificationsReport.py --data-source azsql-ncus --filename-prefix classification-report
+```
+
+This creates `reports\classification-report.xlsx`.
+
+Choose both the output directory and filename for a 24-hour report:
+
+```powershell
+python PurviewClassificationsReport.py --authentication-mode azure-credential --data-source azsql-ncus --output-directory azsqldb-ncus --filename-prefix classification-report --modified-within 24h
+```
+
+This creates `azsqldb-ncus\classification-report.xlsx`.
+
+Save a 30-day report under a different filename in the same directory:
+
+```powershell
+python PurviewClassificationsReport.py --authentication-mode azure-credential --data-source azsql-ncus --output-directory azsqldb-ncus --filename-prefix class-30d --modified-within 30d
+```
+
+This creates `azsqldb-ncus\class-30d.xlsx`, leaving
+`azsqldb-ncus\classification-report.xlsx` unchanged.
+
+Use a custom output directory and filename prefix for separate source files:
 
 ```powershell
 python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --output-directory "exports" --filename-prefix "classification-inventory"
@@ -290,13 +352,26 @@ Use a non-default environment file:
 python PurviewClassificationsReport.py --data-source "SqlServer-Prod" --env-file ".\purview-prod.env"
 ```
 
-Force asset matching via a qualified-name prefix (useful when a source's
+Add an asset-matching qualified-name prefix (useful when a source's
 registration metadata has no endpoint that matches catalog asset qualified
 names):
 
 ```powershell
 python PurviewClassificationsReport.py --data-source "DataLake-Raw" --qualified-name-prefix "https://mydatalake.dfs.core.windows.net/raw"
 ```
+
+This still creates `reports\classifications.xlsx`. The explicit locator is
+added to the source's discovered locators; it does not restrict matching to
+that prefix alone.
+
+Combine asset matching with a custom output directory and filename:
+
+```powershell
+python PurviewClassificationsReport.py --data-source "DataLake-Raw" --qualified-name-prefix "https://mydatalake.dfs.core.windows.net/raw" --output-directory "exports" --filename-prefix "raw-classifications"
+```
+
+This creates `exports\raw-classifications.xlsx`; the URL affects asset
+matching only.
 
 Reduce catalog search page size (e.g. to work around throttling):
 
@@ -311,9 +386,22 @@ seven days:
 python PurviewClassificationsReport.py --data-source ALL --file-per-data-source --modified-within 7d
 ```
 
+## Troubleshooting output files
+
+If a run reports `Permission denied` for an `.xlsx` file, close that workbook
+in Excel or any other application that may be locking it, then rerun the
+command. Also check that you have write access to the output directory and
+that the existing file is not read-only.
+
+Repeated runs with the same output directory and filename target the same
+file, even when `--modified-within` or `--qualified-name-prefix` changes.
+Use `--filename-prefix` to choose another filename; changing
+`--qualified-name-prefix` will not avoid an output-file collision.
+
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License. A standalone `LICENSE` file
+is not currently included in this repository.
 
 ## Notes
 
